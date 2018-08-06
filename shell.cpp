@@ -1,5 +1,5 @@
 /*
-shell Copyright © 2013 Jeremy Bernstein and Bill Orcutt
+shell Copyright (c) 2013-2018 Jeremy Bernstein and Bill Orcutt
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -21,9 +21,14 @@ THE SOFTWARE.
 */
 
 #include "ext.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <string>
+#include <vector>
+#include <memory>
+#include <iostream>
 
 #define MAX_MESSAGELEN	4096
 
@@ -78,10 +83,26 @@ int WriteToPipe(HANDLE fh, char *str);
 int ReadFromPipe(HANDLE fh, char *str, DWORD slen);
 #endif
 
+struct t_shell_threadinfo
+{
+	std::string cmdstring;
+	std::vector<std::string> cmdargs;
+};
+
+struct t_shell_threading
+{
+	std::thread thr;
+	std::mutex tcmut;
+	std::condition_variable tcvar;
+	std::unique_ptr<t_shell_threadinfo> info;
+	std::atomic<int> run;
+
+	t_shell_threading() : info{nullptr}, run{false} {}
+};
+
 typedef struct _shell
 {
     t_object		ob;
-	void			*pollqfn;	//shutdown
 	void			*textout;
 	void			*bangout;
 	char			cmdbuf[MAX_MESSAGELEN]; //command
@@ -98,6 +119,8 @@ typedef struct _shell
 #ifdef WIN_VERSION
 	char			unicode;
 #endif
+	char			symout;
+	t_shell_threading *threading;
 } t_shell;
 
 t_class *shell_class;
@@ -108,7 +131,7 @@ void shell_anything(t_shell *x, t_symbol *s, long ac, t_atom *av);
 void shell_do(t_shell *x, t_symbol *s, long ac, t_atom *av);
 void shell_write(t_shell *x, t_symbol *s, long ac, t_atom *av);
 void shell_dowrite(t_shell *x, t_symbol *s, long ac, t_atom *av);
-void shell_stop(t_shell *x);	
+void shell_stop(t_shell *x);
 void shell_kill(t_shell *x);
 void shell_qfn(t_shell *x);
 void shell_assist(t_shell *x, void *b, long m, long a, char *s);
@@ -116,7 +139,10 @@ void shell_free(t_shell *x);
 void *shell_new(t_symbol *s, long ac, t_atom *av);
 void shell_output(t_shell *x, t_symbol *s, long ac, t_atom *av);
 Boolean shell_readline(t_shell *x);
-void shell_atoms2text(long ac, t_atom *av, char *text);
+void shell_atoms2string(long ac, t_atom *av, std::string &str);
+
+void shell_threadfn(t_shell *x);
+void shell_terminated(t_shell *x);
 
 t_max_err shell_attr_wd_set(t_shell *x, void *attr, long ac, t_atom *av);
 t_max_err shell_attr_wd_get(t_shell *x, void *attr, long *ac, t_atom **av);
@@ -146,7 +172,7 @@ int C74_EXPORT main(void)
 
 	CLASS_ATTR_SYM(shell_class, "wd", 0, t_shell, wd);
 	CLASS_ATTR_ACCESSORS(shell_class, "wd", (method)shell_attr_wd_get, (method)shell_attr_wd_set);
-	CLASS_ATTR_DEFAULT_SAVE(shell_class, "wd", 0, "");
+	CLASS_ATTR_DEFAULT_SAVE(shell_class, "wd", 0, "(default)");
 	CLASS_ATTR_STYLE_LABEL(shell_class, "wd", 0, "filefolder", "Working directory");
 
 	CLASS_ATTR_SYM(shell_class, "shell", 0, t_shell, shell);
@@ -154,11 +180,16 @@ int C74_EXPORT main(void)
 	CLASS_ATTR_DEFAULT_SAVE(shell_class, "shell", 0, "");
 	CLASS_ATTR_STYLE_LABEL(shell_class, "shell", 0, "file", "Shell");
 
+	CLASS_ATTR_CHAR(shell_class, "symout", 0, t_shell, symout);
+	CLASS_ATTR_DEFAULT_SAVE(shell_class, "symout", 0, "0");
+	CLASS_ATTR_STYLE_LABEL(shell_class, "symout", 0, "onoff", "Output Line as One Symbol");
+
 	class_register(CLASS_BOX, shell_class);
 
 	ps_default = gensym("(default)");
 	ps_nothing = gensym("");
 
+	post("shell: compiled %s", __TIMESTAMP__);
 	return 0;
 }
 
@@ -262,63 +293,74 @@ void shell_write(t_shell *x, t_symbol *s, long ac, t_atom *av)
 		defer_medium(x, (method)shell_dowrite, s, (short)ac, av);
 	}
 }
-
-void shell_atoms2text(long ac, t_atom *av, char *text)
+void shell_atoms2string(long ac, t_atom *av, std::string &str)
 {
 	char tmp[MAX_MESSAGELEN];
 	int i;
-	
+
 	for (i = 0; i < ac; i++) {
 		switch(atom_gettype(av + i)) {
 			case A_LONG:
-				snprintf_zero(tmp, MAX_MESSAGELEN, "%"ATOM_LONG_FMT_MODIFIER"d", atom_getlong(av + i));
+				snprintf_zero(tmp, MAX_MESSAGELEN, "%" ATOM_LONG_FMT_MODIFIER "d", atom_getlong(av + i));
 				break;
 			case A_FLOAT:
 				snprintf_zero(tmp, MAX_MESSAGELEN, "%f", atom_getfloat(av + i));
 				break;
 			case A_SYM:
-				{
-					const char *formatstr = "%s";
-					const char *symstr = atom_getsym(av + i)->s_name;
-					if (strchr(symstr, ' ') && *symstr != '\\' && *(symstr+1) != '\"') {
-						formatstr = "\"%s\"";
-					}
-					snprintf_zero(tmp, MAX_MESSAGELEN, formatstr, atom_getsym(av + i)->s_name);
+			{
+				const char *formatstr = "%s";
+				const char *symstr = atom_getsym(av + i)->s_name;
+				if (strchr(symstr, ' ') && *symstr != '\\' && *(symstr+1) != '\"') {
+					formatstr = "\"%s\"";
 				}
+				snprintf_zero(tmp, MAX_MESSAGELEN, formatstr, atom_getsym(av + i)->s_name);
+			}
 				break;
 			default:
 				continue;
 		}
-		if (i > 0) strncat(text, " ", MAX_MESSAGELEN);
-		strncat(text, tmp, MAX_MESSAGELEN);
+		if (i > 0) {
+			str += " ";
+		}
+		str += tmp;
 	}
 }
 
 void shell_dowrite(t_shell *x, t_symbol *s, long ac, t_atom *av)
 {
 	if (x->pid && WRITE_HANDLE(x)) {
-		char cmd[MAX_MESSAGELEN] = "";
-		
-		if (ac && av) {
-			shell_atoms2text(ac, av, cmd);
-		}
+		std::string cmd;
+
+		shell_atoms2string(ac, av, cmd);
+
 		if (s == gensym("penter")) {
-			strncat(cmd, "\n", MAX_MESSAGELEN);
+			cmd += "\n";
 		}
-		if (*cmd) {
-			WRITE(WRITE_HANDLE(x), cmd);
+		if (cmd.length()) {
+			WRITE(WRITE_HANDLE(x), cmd.c_str());
 		}
 	}
 }
 
+static inline std::string quote(std::string &s)
+{
+	if (s.find(' ') != std::string::npos) {
+		std::string quoted("\"");
+		quoted += s;
+		quoted += "\"";
+		return quoted;
+	}
+	return s;
+}
+
 void shell_do(t_shell *x, t_symbol *s, long ac, t_atom *av)	
 {
-	char cmd[MAX_MESSAGELEN] = "";
+	std::string cmd("");
 	char shellcmd[MAX_PATH_CHARS] = "sh";
+	std::vector<std::string> args;
 
 	if (s) {
 		char cmdtemp[MAX_PATH_CHARS] = "";
-		const char *formatstr = "%s";
 
 		if (path_getseparator(s->s_name)) {
 			short cmdvol;
@@ -333,20 +375,17 @@ void shell_do(t_shell *x, t_symbol *s, long ac, t_atom *av)
 			strncpy(cmdtemp, s->s_name, MAX_PATH_CHARS);
 		}
 
-		if (strchr(cmdtemp, ' ')) {
-			formatstr = "\"%s\"";
-		}
-
-		snprintf_zero(cmd, MAX_MESSAGELEN, formatstr, cmdtemp);
+		cmd = cmdtemp;
+		cmd = quote(cmd);
 
 		// process args
 		if (ac && av) {
-			strncat(cmd, " ", MAX_MESSAGELEN);
-			shell_atoms2text(ac, av, cmd);
+			cmd += " ";
+			shell_atoms2string(ac, av, cmd);
 		}
 	}
 	else {
-		strncpy(cmd, x->cmdbuf, MAX_MESSAGELEN);
+		cmd = x->cmdbuf;
 	}
 
 	if (x->shell != ps_nothing) {
@@ -354,14 +393,11 @@ void shell_do(t_shell *x, t_symbol *s, long ac, t_atom *av)
 		// brute force and potentially wrong, assuming that any other shell will use -c to read input from the string
 	}
 
-	if (*cmd) {
+	if (cmd.length()) {
 #ifdef MAC_VERSION
-		char *args[] = { 
-			(char *)shellcmd,
-			(char *)"-c", 
-			(char *)cmd, 
-			(char *)0 
-		};
+		args.push_back(shellcmd);
+		args.push_back("-c");
+		args.push_back(cmd);
 #else
 		const char *shellarg = "/U /C"; // for CMD.exe, /U = unicode, /C = returning after executing string arg
 
@@ -377,30 +413,88 @@ void shell_do(t_shell *x, t_symbol *s, long ac, t_atom *av)
 			getenv_s(&nSize, shellcmd, MAX_PATH_CHARS, "COMSPEC");
 		}
 
-		char *args[] = {
-			(char *)shellcmd,
-			(char *)shellarg,
-			(char *)cmd, 
-			(char *)0 
-		};
+		args.push_back(shellcmd);
+		args.push_back(shellarg);
+		args.push_back(cmd);
 #endif
 
 		shell_stop(x); // kill previous command, if any
-		if ((shell_pipe_open(x, &(READ_HANDLE(x)), &(WRITE_HANDLE(x)), 
-			shellcmd, args,
-			&x->pid, (int)x->merge_stderr)))
+
+		std::unique_ptr<t_shell_threadinfo> ti(new t_shell_threadinfo);
+		ti->cmdstring = shellcmd;
+		ti->cmdargs = args;
+		x->threading->info = std::move(ti);
+		x->threading->run = true;
+		x->threading->tcvar.notify_all();
+	}
+}
+
+void shell_terminated(t_shell *x)
+{
+	x->pid = 0;
+	outlet_bang(x->bangout);
+}
+
+void shell_threadfn(t_shell *x)
+{
+	t_shell_threading *threading = x->threading;
+	while (1) {
+		std::unique_ptr<t_shell_threadinfo> info;
+
+		{
+			std::unique_lock<std::mutex> lk(threading->tcmut);
+			threading->tcvar.wait(lk, [threading] { return (threading->run ? true : false); });
+			threading->run = false;
+			info = std::move(threading->info);
+		}
+		if (!info) break;
+
+		int size = info->cmdargs.size() + 1;
+		char **args = new char*[size];
+		char *cmdstr = const_cast<char *>(info->cmdstring.c_str());
+		char **a = args;
+
+		for (auto it = info->cmdargs.begin(); it < info->cmdargs.end(); it++) {
+			*a++ = const_cast<char *>((*it).c_str());
+		}
+		*a = nullptr;
+
+		if ((shell_pipe_open(x, &(READ_HANDLE(x)), &(WRITE_HANDLE(x)),
+							 cmdstr, args,
+							 &x->pid, (int)x->merge_stderr)))
 		{
 #ifdef MAC_VERSION // read and write are the same, don't need to do this twice
-			int flags;
-			
-			flags = fcntl(WRITE_HANDLE(x), F_GETFL, 0);
-			flags |= O_NONBLOCK;
+			int flags = fcntl(WRITE_HANDLE(x), F_GETFL, 0) | O_NONBLOCK;
 			fcntl(WRITE_HANDLE(x), F_SETFL, flags);
 #endif
-			strncpy(x->cmdbuf, cmd, MAX_MESSAGELEN);
-			qelem_set(x->pollqfn);
+			if (size > 2) {
+				strncpy(x->cmdbuf, args[2], MAX_MESSAGELEN);
+			}
+			else x->cmdbuf[0] = '\0';
+
+			// ready to read
+			while (x->pid) {
+				int rv;
+				while (shell_readline(x))
+					;
+				// check if the process has terminated
+#ifdef MAC_VERSION
+				if (waitpid(x->pid, &rv, WNOHANG))
+#else
+				if (WaitForSingleObject(x->pid, 0) == WAIT_OBJECT_0)
+#endif
+				{
+					shell_pipe_close(x, &READ_HANDLE(x), &WRITE_HANDLE(x), x->pid, &rv);
+					defer_low(x, (method)shell_terminated, NULL, 0, NULL);
+					break;
+				}
+				// otherwise, requeue
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			}
 		}
-	}		
+		delete[] args;
+	}
+	// std::cout << "exiting threadfn" << std::endl;
 }
 
 void shell_bang(t_shell *x)
@@ -408,20 +502,17 @@ void shell_bang(t_shell *x)
 	if (!x->pid) {
 		defer_medium(x, (method)shell_do, 0, 0, 0);
 	}
-
 }
 
 void shell_stop(t_shell *x)	
 {
-	qelem_unset(x->pollqfn);
 	if (x->pid) {
 		int rv;
 #ifdef MAC_VERSION
 		kill(x->pid, SIGKILL); // pipe_close_3 will do this on windows
 #endif
 		shell_pipe_close(x, &READ_HANDLE(x), &WRITE_HANDLE(x), x->pid, &rv);
-		x->pid = 0;			
-		outlet_bang(x->bangout);
+		shell_terminated(x);
 	}
 }
 
@@ -434,11 +525,26 @@ void shell_kill(t_shell *x)
 
 void shell_output(t_shell *x, t_symbol *s, long ac, t_atom *av)
 {
-	t_symbol *outsym;
-	
-	if (ac && av && (outsym = atom_getsym(av))) {
-		// TODO: break string up into atoms?
-		outlet_anything(x->textout, outsym, 0, NULL);
+	if (ac && av && atomisstring(av)) {
+		long argc = 0;
+		t_atom *argv = NULL;
+		t_string *str = (t_string *)atom_getobj(av);
+
+		if (x->symout) {
+			outlet_anything(x->textout, gensym(str->s_text), 0, NULL);
+		}
+		else {
+			if (atom_setparse(&argc, &argv, str->s_text) == MAX_ERR_NONE) {
+				if (atom_gettype(argv) == A_SYM) {
+					outlet_anything(x->textout, atom_getsym(argv), argc - 1, argv + 1);
+				}
+				else {
+					outlet_list(x->textout, NULL, argc, argv);
+				}
+				sysmem_freeptr(argv);
+			}
+		}
+		object_free(str);
 	}
 }
 
@@ -490,8 +596,8 @@ Boolean shell_readline(t_shell *x)
 			sysmem_copyptr(lp2, line, (long)(lp1-lp2));
 			line[lp1-lp2] = '\0';
 			lp2 = lp1 + 1;
-			atom_setsym(&a, gensym(line));
-			defer_medium(x, (method)shell_output, NULL, 1, &a);
+			atom_setobj(&a, string_new(line));
+			defer(x, (method)shell_output, NULL, 1, &a);
 		}
 		if (lp2 && *lp2) { // there's an incomplete line, rewrite it to the front of the
 						   // read buffer and set the offset.
@@ -516,8 +622,8 @@ Boolean shell_readline(t_shell *x)
 		}
 	}
 	if (offset) {
-		atom_setsym(&a, gensym(line));
-		defer_medium(x, (method)shell_output, NULL, 1, &a);
+		atom_setobj(&a, string_new(line));
+		defer(x, (method)shell_output, NULL, 1, &a);
 	}
 #ifdef WIN_VERSION
 	if (unicodestream) {
@@ -525,29 +631,6 @@ Boolean shell_readline(t_shell *x)
 	}
 #endif
 	return FALSE;
-}
-
-void shell_qfn(t_shell *x)
-{
-	if (x && READ_HANDLE(x)) {
-		int rv;
-		while (shell_readline(x))
-			;
-		// check if the process has terminated
-#ifdef MAC_VERSION
-		if (waitpid(x->pid, &rv, WNOHANG)) 
-#else
-		if (WaitForSingleObject(x->pid, 0) == WAIT_OBJECT_0)
-#endif
-		{
-			shell_pipe_close(x, &READ_HANDLE(x), &WRITE_HANDLE(x), x->pid, &rv);
-			x->pid = 0;			
-			outlet_bang(x->bangout);
-			return;
-		}
-		// otherwise, requeue
-		qelem_set(x->pollqfn);
-	}
 }
 
 void doReport()
@@ -563,7 +646,7 @@ void shell_assist(t_shell *x, void *b, long m, long a, char *s)
 		switch (a) {
 
 			case 0:
-				strcpy(s,"stdout as symbol");
+				strcpy(s,"stdout as list");
 				break;
 
 			case 1:
@@ -576,9 +659,13 @@ void shell_assist(t_shell *x, void *b, long m, long a, char *s)
 void shell_free(t_shell *x)	
 {
 	shell_stop(x);
-	
-	if (x->pollqfn)
-		qelem_free(x->pollqfn);
+
+	x->threading->info = nullptr;
+	x->threading->run = true;
+	x->threading->tcvar.notify_all();
+	x->threading->thr.join();
+
+	delete x->threading;
 }
 
 void *shell_new(t_symbol *s, long ac, t_atom *av)
@@ -589,7 +676,6 @@ void *shell_new(t_symbol *s, long ac, t_atom *av)
 	if (x) {
 		x->bangout = bangout(x);
 		x->textout = outlet_new(x,NULL);
-		x->pollqfn = qelem_new(x, (method)shell_qfn);
 #ifdef MAC_VERSION
 		x->fd = 0;
 #else
@@ -603,6 +689,9 @@ void *shell_new(t_symbol *s, long ac, t_atom *av)
 		x->shell = ps_nothing;
 
 		attr_args_process(x, (short)ac, av);
+
+		x->threading = new t_shell_threading;
+		x->threading->thr = std::thread(shell_threadfn, x);
 	}
 	return(x);
 }
