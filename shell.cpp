@@ -736,7 +736,7 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 		}
 	}
 
-	*ppid = fork();
+	*ppid = vfork();
 	if (*ppid < 0) {
 		close(masterfd);
 		close(slavefd);
