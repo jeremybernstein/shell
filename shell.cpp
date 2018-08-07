@@ -29,6 +29,8 @@ THE SOFTWARE.
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <mutex>
+#include <atomic>
 
 #define MAX_MESSAGELEN	4096
 
@@ -68,6 +70,7 @@ typedef HANDLE t_procid;
 #define CLEAN_CLOSEHANDLE(h) if (h) { CloseHandle(h); h = 0; }
 #define kill windows_kill
 
+BEGIN_USING_C_LINKAGE
 extern BOOL
 APIENTRY
 MyCreatePipeEx(
@@ -81,6 +84,7 @@ MyCreatePipeEx(
 			   );
 int WriteToPipe(HANDLE fh, char *str);
 int ReadFromPipe(HANDLE fh, char *str, DWORD slen);
+END_USING_C_LINKAGE
 #endif
 
 struct t_shell_threadinfo
@@ -337,7 +341,7 @@ void shell_dowrite(t_shell *x, t_symbol *s, long ac, t_atom *av)
 			cmd += "\n";
 		}
 		if (cmd.length()) {
-			WRITE(WRITE_HANDLE(x), cmd.c_str());
+			WRITE(WRITE_HANDLE(x), const_cast<char *>(cmd.c_str()));
 		}
 	}
 }
@@ -536,10 +540,10 @@ void shell_output(t_shell *x, t_symbol *s, long ac, t_atom *av)
 		else {
 			if (atom_setparse(&argc, &argv, str->s_text) == MAX_ERR_NONE) {
 				if (atom_gettype(argv) == A_SYM) {
-					outlet_anything(x->textout, atom_getsym(argv), argc - 1, argv + 1);
+					outlet_anything(x->textout, atom_getsym(argv), short(argc - 1), argv + 1);
 				}
 				else {
-					outlet_list(x->textout, NULL, argc, argv);
+					outlet_list(x->textout, NULL, short(argc), argv);
 				}
 				sysmem_freeptr(argv);
 			}
