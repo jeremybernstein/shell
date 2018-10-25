@@ -704,6 +704,10 @@ void *shell_new(t_symbol *s, long ac, t_atom *av)
 // http://rachid.koucha.free.fr/tech_corner/pty_pdip.html
 // using posix_openpt()
 
+#ifndef NSIG
+# define NSIG 32
+#endif
+
 int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char *cmd, char *argv[], t_procid *ppid, int merge_stderr)
 {
 #ifdef MAC_VERSION
@@ -712,7 +716,9 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 	char *slavedevice;
 	int rc;
 	char workingdir[MAX_PATH_CHARS] = "";
-	
+	sigset_t oldmask, newmask;
+	struct sigaction sig_action;
+
 	*ppid = 0;
 	
 	if (masterfd == -1
@@ -740,15 +746,24 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 		}
 	}
 
+	sigfillset(&newmask);
+	if (pthread_sigmask(SIG_SETMASK, &newmask, &oldmask) < 0) {
+		object_error((t_object *)x, "error setting sigmask: %s", strerror(errno));
+		return 0;
+	}
+
 	*ppid = vfork();
 	if (*ppid < 0) {
 		close(masterfd);
 		close(slavefd);
 		return 0; // error
 	}
+
 	if (*ppid == 0) { // child
 		struct termios orig_termios, new_termios;
-		
+
+		umask(0);
+
 		close(masterfd); // close the master
 		
 		// Save the default parameters of the slave side of the PTY
@@ -770,6 +785,26 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 		// As the child is a session leader, set the controlling terminal to be the slave side of the PTY
 		// (Mandatory for programs like the shell to make them manage correctly their outputs)
 		ioctl(0, TIOCSCTTY, 1);
+
+		// reset signals
+		sig_action.sa_handler = SIG_DFL;
+		sig_action.sa_flags = 0;
+		sigemptyset(&sig_action.sa_mask);
+
+		for (int i = 0 ; i < NSIG ; i++) {
+			// Only possible errors are EFAULT or EINVAL
+			// The former wont happen, the latter we
+			// expect, so no need to check return value
+			sigaction(i, &sig_action, NULL);
+		}
+
+		// Unmask all signals in child, since we've no idea
+		// what the caller's done with their signal mask
+		if (pthread_sigmask(SIG_SETMASK, &oldmask, NULL) < 0) {
+			object_error((t_object *)x, "error resetting sigmask (child): %s", strerror(errno));
+			return 0;
+		}
+
 		if (*workingdir) {
 			chdir(workingdir);
 		}
@@ -778,6 +813,11 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 	} else { // parent
 		close(slavefd); // close the slave
 		*masterfd_r = *masterfd_w = masterfd;
+
+		if (pthread_sigmask(SIG_SETMASK, &oldmask, NULL) < 0) {
+			object_error((t_object *)x, "error resetting sigmask: %s", strerror(errno));
+			return masterfd;
+		}
 	}
 	return masterfd;
 #else
