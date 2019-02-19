@@ -672,6 +672,7 @@ Boolean shell_readline(t_shell *x)
 						   // read buffer and set the offset.
 			offset = (long)strlen(lp2) * charsize;
 #ifdef WIN_VERSION
+			strncpy(line, lp2, MAX_MESSAGELEN); // temp copy
 			if (x->unicode) {
 				if (charsize == sizeof(WCHAR)) { // it's really unicode
 					MultiByteToWideChar(CP_UTF8, 0, lp2, -1, unicodestream, MAX_MESSAGELEN);
@@ -689,7 +690,6 @@ Boolean shell_readline(t_shell *x)
 			else
 #endif
 			{
-				strncpy(line, lp2, MAX_MESSAGELEN); // temp copy
 				strncpy(stream, line, MAX_MESSAGELEN);
 			}
 		} else {
