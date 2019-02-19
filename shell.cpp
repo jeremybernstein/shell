@@ -562,6 +562,53 @@ void shell_output(t_shell *x, t_symbol *s, long ac, t_atom *av)
 	}
 }
 
+#ifdef WIN_VERSION
+WCHAR *shell_char_to_wchar(int cp, const char *text, int nbytes, int *wlen)
+{
+	WCHAR *wbuf = NULL;
+	int wbytes = 0;
+
+	wbytes = MultiByteToWideChar(cp, 0, (char *)text, nbytes, NULL, 0);
+	if (wbytes) {
+		wbuf = (WCHAR *)sysmem_newptr(wbytes * sizeof(WCHAR));
+		wbytes = MultiByteToWideChar(cp, 0, (char *)text, nbytes, wbuf, wbytes);
+		if (!wbytes) {
+			C74_ASSERT(0);
+		}
+	}
+	else {
+		C74_ASSERT(0);
+	}
+	*wlen = wbytes;
+	return wbuf;
+}
+
+char *shell_utf8_to_native(const char *ubuf, int ubytes, int *len)
+{
+	char *buf = NULL;
+	int bytes = 0;
+	int wbytes;
+	WCHAR *wbuf = shell_char_to_wchar(CP_UTF8, ubuf, ubytes, &wbytes);
+	if (wbuf) {
+		bytes = WideCharToMultiByte(CP_ACP, 0, wbuf, wbytes, NULL, 0, NULL, NULL);
+		if (bytes) {
+			buf = (char *)sysmem_newptr(bytes);
+			bytes = WideCharToMultiByte(CP_ACP, 0, wbuf, wbytes, buf, bytes, NULL, NULL);
+			if (!bytes) {
+				C74_ASSERT(0);
+			}
+		}
+		else {
+			C74_ASSERT(0);
+		}
+		sysmem_freeptr(wbuf);
+	}
+	*len = bytes;
+	return buf;
+}
+
+#endif
+
 Boolean shell_readline(t_shell *x)
 {
 	char stream[MAX_MESSAGELEN];
@@ -598,17 +645,25 @@ Boolean shell_readline(t_shell *x)
 				stream[sizeinchars] = '\0';
 			}
 			else {
-				// it's an ANSI buffer, treat unicodestream as a char* from now on
-				sysmem_copyptr(unicodestream, stream, bytes);
-				stream[bytes] = '\0';
+				int widelen = 0;
+				WCHAR *widebuf = shell_char_to_wchar(CP_ACP, (const char *)unicodestream, bytes, &widelen);
+				if (widebuf) {
+					int sizeinchars = WideCharToMultiByte(CP_UTF8, 0, widebuf, widelen, stream, MAX_MESSAGELEN, NULL, NULL);
+					stream[sizeinchars] = '\0';
+					sysmem_freeptr(widebuf);
+				}
 				charsize = 1;
 			}
 		}
 #endif
 		lp2 = stream;
 		while ((lp1 = strchr(lp2, '\n'))) { // for each complete line...
-			sysmem_copyptr(lp2, line, (long)(lp1-lp2));
-			line[lp1-lp2] = '\0';
+			size_t cbytes = lp1 - lp2;
+			if (lp1 != stream && *(lp1 - 1) == '\r') {
+				cbytes -= 1;
+			}
+			sysmem_copyptr(lp2, line, (long)cbytes);
+			line[cbytes] = '\0';
 			lp2 = lp1 + 1;
 			atom_setobj(&a, string_new(line));
 			defer(x, (method)shell_output, NULL, 1, &a);
@@ -622,7 +677,13 @@ Boolean shell_readline(t_shell *x)
 					MultiByteToWideChar(CP_UTF8, 0, lp2, -1, unicodestream, MAX_MESSAGELEN);
 				}
 				else {
-					strncpy(lp2, (char *)unicodestream, MAX_MESSAGELEN);
+					int blen;
+					char *buf = shell_utf8_to_native(lp2, -1, &blen);
+					// convert back to the native code page
+					if (buf) {
+						strncpy((char *)unicodestream, (const char *)buf, MAX_MESSAGELEN);
+						sysmem_freeptr(buf);
+					}
 				}
 			}
 			else
