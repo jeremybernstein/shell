@@ -1,5 +1,5 @@
 /*
-shell Copyright (c) 2013-2018 Jeremy Bernstein and Bill Orcutt
+shell Copyright (c) 2013-2019 Jeremy Bernstein and Bill Orcutt
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
