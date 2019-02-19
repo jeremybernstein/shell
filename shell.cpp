@@ -113,11 +113,11 @@ typedef struct _shell
 	char			cmdbuf[MAX_MESSAGELEN]; //command
 #ifdef MAC_VERSION
 	t_fildes		fd;
-	long			forkmode;
 #else
 	t_fildes		fd_r;
 	t_fildes		fd_w;
 #endif
+	long			forkmode; // disabled on Windows
 	t_procid		pid;
 	char			merge_stderr;
 	t_symbol		*wd;
