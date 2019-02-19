@@ -60,6 +60,7 @@ typedef int t_procid;
 #define READ		read
 #define READ_HANDLE(x)	x->fd
 #define WRITE_HANDLE(x) x->fd
+typedef pid_t (*t_forkfn)(void);
 #else
 typedef HANDLE t_fildes;
 typedef HANDLE t_procid;
@@ -112,6 +113,7 @@ typedef struct _shell
 	char			cmdbuf[MAX_MESSAGELEN]; //command
 #ifdef MAC_VERSION
 	t_fildes		fd;
+	long			forkmode;
 #else
 	t_fildes		fd_r;
 	t_fildes		fd_w;
@@ -170,6 +172,10 @@ int C74_EXPORT main(void)
 	class_addmethod(shell_class, (method)shell_assist,		"assist",	A_CANT,		0);
 	class_addmethod(shell_class, (method)doReport,			"dblclick",	A_CANT,		0);
 	
+	CLASS_ATTR_CHAR(shell_class, "symout", 0, t_shell, symout);
+	CLASS_ATTR_DEFAULT_SAVE(shell_class, "symout", 0, "0");
+	CLASS_ATTR_STYLE_LABEL(shell_class, "symout", 0, "onoff", "Output Line as One Symbol");
+
 	CLASS_ATTR_CHAR(shell_class, "stderr", 0, t_shell, merge_stderr);
 	CLASS_ATTR_DEFAULT_SAVE(shell_class, "stderr", 0, "0");
 	CLASS_ATTR_STYLE_LABEL(shell_class, "stderr", 0, "onoff", "Merge STDERR With STDOUT");
@@ -184,16 +190,20 @@ int C74_EXPORT main(void)
 	CLASS_ATTR_DEFAULT_SAVE(shell_class, "shell", 0, "");
 	CLASS_ATTR_STYLE_LABEL(shell_class, "shell", 0, "file", "Shell");
 
-	CLASS_ATTR_CHAR(shell_class, "symout", 0, t_shell, symout);
-	CLASS_ATTR_DEFAULT_SAVE(shell_class, "symout", 0, "0");
-	CLASS_ATTR_STYLE_LABEL(shell_class, "symout", 0, "onoff", "Output Line as One Symbol");
+	CLASS_ATTR_LONG(shell_class, "forkmode", 0, t_shell, forkmode);
+	CLASS_ATTR_ENUMINDEX2(shell_class, "forkmode", 0, "fork", "vfork");
+	CLASS_ATTR_DEFAULT_SAVE(shell_class, "forkmode", 0, "0");
+	CLASS_ATTR_STYLE_LABEL(shell_class, "forkmode", 0, "enumindex", "Fork Method (Expert)");
+#ifdef WIN_VERSION
+	CLASS_ATTR_INVISIBLE(shell_class, "forkmode", 0);
+#endif
 
 	class_register(CLASS_BOX, shell_class);
 
 	ps_default = gensym("(default)");
 	ps_nothing = gensym("");
 
-	post("shell: compiled %s", __TIMESTAMP__);
+	object_post(NULL, "shell: compiled %s", __TIMESTAMP__);
 	return 0;
 }
 
@@ -752,7 +762,9 @@ int shell_pipe_open(t_shell *x, t_fildes *masterfd_r, t_fildes *masterfd_w, char
 		return 0;
 	}
 
-	*ppid = vfork();
+	// SIGTTOU or SIGTTIN won't be sent in processes created using vfork, which breaks SSH
+	t_forkfn forkfn = (t_forkfn)(x->forkmode ? vfork : fork);
+	*ppid = forkfn();
 	if (*ppid < 0) {
 		close(masterfd);
 		close(slavefd);
