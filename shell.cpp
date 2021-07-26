@@ -609,6 +609,36 @@ char *shell_utf8_to_native(const char *ubuf, int ubytes, int *len)
 
 #endif
 
+char *shell_escape_backslashes(const char *str)
+{
+	// count the backslashes
+	t_ptr_size ct = 0;
+	const char *c = str;
+	char *newstr = NULL;
+	char *n;
+	t_bool hasslash = false;
+
+	while (c && *c) {
+		if (*c++ == '\\') {
+			ct++;
+			hasslash = true;
+		}
+		ct++;
+	}
+	if (!hasslash) return NULL;
+	newstr = (char *)sysmem_newptr(ct + 1);
+	c = str;
+	n = newstr;
+	while (c && *c) {
+		if (*c == '\\') {
+			*n++ = '\\';
+		}
+		*n++ = *c++;
+	}
+	*n = '\0';
+	return newstr;
+}
+
 Boolean shell_readline(t_shell *x)
 {
 	char stream[MAX_MESSAGELEN];
@@ -619,7 +649,9 @@ Boolean shell_readline(t_shell *x)
 	t_atom a;
 	char *readstream = stream;
 	int charsize = 1;
-		
+	char *escape;
+	t_string *str;
+
 #ifdef WIN_VERSION
 	WCHAR *unicodestream = NULL;
 
@@ -665,7 +697,14 @@ Boolean shell_readline(t_shell *x)
 			sysmem_copyptr(lp2, line, (long)cbytes);
 			line[cbytes] = '\0';
 			lp2 = lp1 + 1;
-			atom_setobj(&a, string_new(line));
+
+			escape = shell_escape_backslashes(line);
+			str = string_new(escape ? escape : line);
+			if (escape) {
+				sysmem_freeptr(escape);
+				escape = NULL;
+			}
+			atom_setobj(&a, str);
 			defer(x, (method)shell_output, NULL, 1, &a);
 		}
 		if (lp2 && *lp2) { // there's an incomplete line, rewrite it to the front of the
@@ -697,7 +736,13 @@ Boolean shell_readline(t_shell *x)
 		}
 	}
 	if (offset) {
-		atom_setobj(&a, string_new(line));
+		escape = shell_escape_backslashes(line);
+		str = string_new(escape ? escape : line);
+		if (escape) {
+			sysmem_freeptr(escape);
+			escape = NULL;
+		}
+		atom_setobj(&a, str);
 		defer(x, (method)shell_output, NULL, 1, &a);
 	}
 #ifdef WIN_VERSION
